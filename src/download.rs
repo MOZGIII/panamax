@@ -58,28 +58,35 @@ pub enum OpenFileError {
     DirectoryCreation(#[source] std::io::Error),
 }
 
+async fn with_dir_creation_fallback<Func, Fut, T>(mut op: Func, file_path: &Path) -> Fut::Output
+where
+    Func: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, std::io::Error>>,
+{
+    let result = op().await;
+    let err = match result {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => err,
+        result => return result,
+    };
+
+    // If the path don't have a parent - don't do anything, just return
+    // the error we already got.
+    let parent = file_path.parent().ok_or(err)?;
+
+    fs::create_dir_all(parent).await?;
+
+    op().await
+}
+
 pub async fn open_file(
     mut opts: tokio::fs::OpenOptions,
     path: &Path,
 ) -> Result<tokio::fs::File, OpenFileError> {
     let opts = opts.create(true);
     let open = || opts.open(path);
-
-    let result = open().await;
-    let err = match result {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => err,
-        result => return result.map_err(OpenFileError::Open),
-    };
-
-    // If the path don't have a parent - don't do anything, just return
-    // the error we already got.
-    let parent = path.parent().ok_or_else(|| OpenFileError::Open(err))?;
-
-    fs::create_dir_all(parent)
+    with_dir_creation_fallback(open, path)
         .await
-        .map_err(OpenFileError::DirectoryCreation)?;
-
-    open().await.map_err(OpenFileError::Open)
+        .map_err(OpenFileError::Open)
 }
 
 /// Write a string to a file, creating directories if needed.
@@ -127,16 +134,10 @@ pub async fn copy_file_create_dir_with_sha256(from: &Path, to: &Path) -> Result<
 
 /// Copy a file, creating `to`'s directory if it doesn't exist.
 pub async fn copy_file_create_dir(from: &Path, to: &Path) -> Result<(), DownloadError> {
-    if to.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = to.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent).await?;
-        }
-    }
-
-    fs::copy(from, to).await?;
+    let copy = || fs::copy(from, to);
+    with_dir_creation_fallback(copy, to)
+        .await
+        .map_err(DownloadError::Io)?;
     Ok(())
 }
 
@@ -210,10 +211,20 @@ pub async fn download(
     force_download: bool,
     user_agent: &HeaderValue,
 ) -> Result<(), DownloadError> {
-    if path.exists() && !force_download {
-        if let Some(h) = hash {
+    if !force_download {
+        let result = tokio::fs::File::open(path).await;
+        let is_not_found = matches!(result, Err(ref err @ std::io::Error { .. }) if err.kind() == ErrorKind::NotFound);
+
+        let file_exists = !is_not_found;
+
+        if file_exists {
+            let h = match hash {
+                Some(hash) => hash,
+                None => return Ok(()),
+            };
+
             // Verify SHA-256 hash on the filesystem.
-            let mut file = tokio::fs::File::open(path).await?;
+            let mut file = result?;
             let mut buf = [0u8; 4096];
             let mut sha256 = Sha256::new();
 
@@ -231,8 +242,6 @@ pub async fn download(
                 // Calculated hash matches specified hash.
                 return Ok(());
             }
-        } else {
-            return Ok(());
         }
     }
 
