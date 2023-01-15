@@ -1,15 +1,16 @@
 use reqwest::header::{HeaderValue, USER_AGENT};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::Write;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::{fs, io};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Error, Debug)]
 pub enum DownloadError {
+    #[error("unable to opne the file {1:?}: {0}")]
+    OpenFile(OpenFileError, PathBuf),
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
     #[error("HTTP download error: {0}")]
@@ -49,74 +50,93 @@ pub fn append_to_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(new_path)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum OpenFileError {
+    #[error("opening the file: {0}")]
+    Open(#[source] std::io::Error),
+    #[error("creating directory for the file: {0}")]
+    DirectoryCreation(#[source] std::io::Error),
+}
+
+pub async fn open_file(
+    mut opts: tokio::fs::OpenOptions,
+    path: &Path,
+) -> Result<tokio::fs::File, OpenFileError> {
+    let opts = opts.create(true);
+    let open = || opts.open(path);
+
+    let result = open().await;
+    let err = match result {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => err,
+        result => return result.map_err(OpenFileError::Open),
+    };
+
+    // If the path don't have a parent - don't do anything, just return
+    // the error we already got.
+    let parent = path.parent().ok_or_else(|| OpenFileError::Open(err))?;
+
+    fs::create_dir_all(parent)
+        .await
+        .map_err(OpenFileError::DirectoryCreation)?;
+
+    open().await.map_err(OpenFileError::Open)
+}
+
 /// Write a string to a file, creating directories if needed.
-pub fn write_file_create_dir(path: &Path, contents: &str) -> Result<(), DownloadError> {
-    let mut res = fs::write(path, contents);
-
-    if let Err(e) = &res {
-        if e.kind() == io::ErrorKind::NotFound {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            res = fs::write(path, contents);
-        }
-    }
-
-    Ok(res?)
-}
-
-/// Create a file, creating directories if needed.
-pub fn create_file_create_dir(path: &Path) -> Result<File, DownloadError> {
-    let mut file_res = File::create(path);
-    if let Err(e) = &file_res {
-        if e.kind() == io::ErrorKind::NotFound {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            file_res = File::create(path);
-        }
-    }
-
-    Ok(file_res?)
-}
-
-pub fn move_if_exists(from: &Path, to: &Path) -> Result<(), DownloadError> {
-    if from.exists() {
-        fs::rename(from, to)?;
-    }
+pub async fn write_file_create_dir(path: &Path, contents: &str) -> Result<(), DownloadError> {
+    let mut file = open_file(OpenOptions::new(), path)
+        .await
+        .map_err(|err| DownloadError::OpenFile(err, path.into()))?;
+    file.write_all(contents.as_bytes()).await?;
     Ok(())
 }
 
-pub fn move_if_exists_with_sha256(from: &Path, to: &Path) -> Result<(), DownloadError> {
+/// Create a file, creating directories if needed.
+pub async fn create_file_create_dir(path: &Path) -> Result<File, DownloadError> {
+    let file = open_file(OpenOptions::new(), path)
+        .await
+        .map_err(|err| DownloadError::OpenFile(err, path.into()))?;
+    Ok(file)
+}
+
+pub async fn move_if_exists(from: &Path, to: &Path) -> Result<(), DownloadError> {
+    match fs::rename(from, to).await {
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(DownloadError::Io(err)),
+        Ok(()) => Ok(()),
+    }
+}
+
+pub async fn move_if_exists_with_sha256(from: &Path, to: &Path) -> Result<(), DownloadError> {
     let sha256_from_path = append_to_path(from, ".sha256");
     let sha256_to_path = append_to_path(to, ".sha256");
-    move_if_exists(&sha256_from_path, &sha256_to_path)?;
-    move_if_exists(from, to)?;
+    move_if_exists(&sha256_from_path, &sha256_to_path).await?;
+    move_if_exists(from, to).await?;
     Ok(())
 }
 
 /// Copy a file and its .sha256, creating `to`'s directory if it doesn't exist.
 /// Fails if the source .sha256 does not exist.
-pub fn copy_file_create_dir_with_sha256(from: &Path, to: &Path) -> Result<(), DownloadError> {
+pub async fn copy_file_create_dir_with_sha256(from: &Path, to: &Path) -> Result<(), DownloadError> {
     let sha256_from_path = append_to_path(from, ".sha256");
     let sha256_to_path = append_to_path(to, ".sha256");
-    copy_file_create_dir(&sha256_from_path, &sha256_to_path)?;
-    copy_file_create_dir(from, to)?;
+    copy_file_create_dir(&sha256_from_path, &sha256_to_path).await?;
+    copy_file_create_dir(from, to).await?;
     Ok(())
 }
 
 /// Copy a file, creating `to`'s directory if it doesn't exist.
-pub fn copy_file_create_dir(from: &Path, to: &Path) -> Result<(), DownloadError> {
+pub async fn copy_file_create_dir(from: &Path, to: &Path) -> Result<(), DownloadError> {
     if to.exists() {
         return Ok(());
     }
     if let Some(parent) = to.parent() {
         if !parent.exists() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).await?;
         }
     }
 
-    fs::copy(from, to)?;
+    fs::copy(from, to).await?;
     Ok(())
 }
 
@@ -136,7 +156,7 @@ async fn one_download(
     let part_path = append_to_path(path, ".part");
     let mut sha256 = Sha256::new();
     {
-        let mut f = create_file_create_dir(&part_path)?;
+        let mut f = create_file_create_dir(&part_path).await?;
         let status = http_res.status();
         if status == 403 || status == 404 {
             let forbidden_path = append_to_path(path, ".notfound");
@@ -144,7 +164,8 @@ async fn one_download(
             fs::write(
                 forbidden_path,
                 format!("Server returned {}: {}", status, &text),
-            )?;
+            )
+            .await?;
             return Err(DownloadError::NotFound {
                 status: status.as_u16(),
                 url: url.to_string(),
@@ -156,7 +177,7 @@ async fn one_download(
             if hash.is_some() {
                 sha256.update(&chunk);
             }
-            f.write_all(&chunk)?;
+            f.write_all(&chunk).await?;
         }
     }
 
@@ -164,18 +185,18 @@ async fn one_download(
 
     if let Some(h) = hash {
         if f_hash == h {
-            move_if_exists(&part_path, path)?;
+            move_if_exists(&part_path, path).await?;
             Ok(())
         } else {
             let badsha_path = append_to_path(path, ".badsha256");
-            fs::write(badsha_path, &f_hash)?;
+            fs::write(badsha_path, &f_hash).await?;
             Err(DownloadError::MismatchedHash {
                 expected: h.to_string(),
                 actual: f_hash,
             })
         }
     } else {
-        fs::rename(part_path, path)?;
+        fs::rename(part_path, path).await?;
         Ok(())
     }
 }
@@ -249,7 +270,7 @@ pub async fn download_with_sha256_file(
     .await?;
 
     let sha256_path = append_to_path(path, ".sha256");
-    write_file_create_dir(&sha256_path, &sha256_data)?;
+    write_file_create_dir(&sha256_path, &sha256_data).await?;
 
     Ok(())
 }

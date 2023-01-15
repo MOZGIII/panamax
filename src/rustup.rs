@@ -231,7 +231,7 @@ pub async fn sync_one_init(
     };
 
     download_with_sha256_file(&source_url, &local_path, retries, false, user_agent).await?;
-    copy_file_create_dir_with_sha256(&local_path, &archive_path)?;
+    copy_file_create_dir_with_sha256(&local_path, &archive_path).await?;
 
     Ok(())
 }
@@ -322,7 +322,7 @@ pub async fn sync_rustup_init(
 
     let rustup_version = get_rustup_version(&release_part_path)?;
 
-    move_if_exists(&release_part_path, &release_path)?;
+    move_if_exists(&release_part_path, &release_path).await?;
 
     let pb = panamax_progress_bar(platforms.len(), prefix);
     pb.enable_steady_tick(Duration::from_millis(10));
@@ -563,7 +563,7 @@ pub fn get_channel_history(path: &Path, channel: &str) -> Result<ChannelHistoryF
     Ok(toml::from_str(&ch_data)?)
 }
 
-pub fn add_to_channel_history(
+pub async fn add_to_channel_history(
     path: &Path,
     channel: &str,
     date: &str,
@@ -588,7 +588,7 @@ pub fn add_to_channel_history(
     let ch_data = toml::to_string(&channel_history)?;
 
     let channel_history_path = path.join(format!("mirror-{}-history.toml", channel));
-    write_file_create_dir(&channel_history_path, &ch_data)?;
+    write_file_create_dir(&channel_history_path, &ch_data).await?;
 
     Ok(())
 }
@@ -642,7 +642,7 @@ pub async fn sync_rustup_channel(
         download_xz,
         platforms,
     )?;
-    move_if_exists_with_sha256(&channel_part_path, &channel_path)?;
+    move_if_exists_with_sha256(&channel_part_path, &channel_path).await?;
 
     let pb = panamax_progress_bar(files.len(), prefix);
     pb.enable_steady_tick(Duration::from_millis(10));
@@ -689,7 +689,7 @@ pub async fn sync_rustup_channel(
 
     if errors_occurred == 0 {
         // Write channel history file
-        add_to_channel_history(path, channel, &date, &files, &extra_files)?;
+        add_to_channel_history(path, channel, &date, &files, &extra_files).await?;
         Ok(())
     } else {
         Err(SyncError::FailedDownloads {
